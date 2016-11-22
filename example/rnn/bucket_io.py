@@ -43,6 +43,8 @@ def default_text2id(sentence, the_vocab):
 def default_gen_buckets(sentences, batch_size, the_vocab):
     len_dict = {}
     max_len = -1
+    # get max length of sentences and a dict(bucket) with key equals sentence length
+    # and value equals the number of sentences in the same bucket
     for sentence in sentences:
         words = default_text2id(sentence, the_vocab)
         if len(words) == 0:
@@ -55,14 +57,24 @@ def default_gen_buckets(sentences, batch_size, the_vocab):
             len_dict[len(words)] = 1
     print(len_dict)
 
+    # len_dict:key l is sentence len, value n is the number of sentences of length l
+    # tl is the cumulated sum of n which is less than batch size
+    # we call len_dict the old bucket,and buckets the new bucket
     tl = 0
     buckets = []
-    for l, n in len_dict.items(): # TODO: There are better heuristic ways to do this    
+    for l, n in len_dict.items(): # TODO: There are better heuristic ways to do this
+        # I think the heuristic is that we can do this with bucketing sentence together
+        # we can use a buffer to store old buckets that are less than batch size
+        # and when samples in the buffer together with samples in the current old bucket are enough(n + tl>=batch_size)
+        # add these samples to a new bucket
         if n + tl >= batch_size:
             buckets.append(l)
             tl = 0
         else:
+            # add all sentences whose old bucket size is less than batch_size to the next bucket
             tl += n
+    # if there still exist sentences that are not allocated to any buckets, add them to the largest bucket
+    # if  tl=0 here, it means that the last bucket can exactly hold the remaining sentences
     if tl > 0:
         buckets.append(max_len)
     return buckets
@@ -136,18 +148,27 @@ class BucketSentenceIter(mx.io.DataIter):
         self.label_name = label_name
         self.model_parallel = model_parallel
 
+        # sort by sentence len in ascending order
         buckets.sort()
+        # buckets stores the sentence lengths for each bucket
         self.buckets = buckets
+        # data of buckets, e.g. self.data[0] may be the bucket(type list) of all sentences of length 1
+        # equivalent to: [[]] * len(buckets)
         self.data = [[] for _ in buckets]
 
         # pre-allocate with the largest bucket for better memory sharing
+        # max(buckets) is the max len of all sentences
         self.default_bucket_key = max(buckets)
 
         for sentence in sentences:
             sentence = self.text2id(sentence, vocab)
             if len(sentence) == 0:
                 continue
+            # look for a bucket that can hold this sentence exactly
+            # bkt stands for sentence len of that bucket
             for i, bkt in enumerate(buckets):
+                # bkt: bucket_key(or you can think of it as max sentence length of this bucket)
+                # not all sentences in the same bucket are of the same length, but all less or equal to bkt
                 if bkt >= len(sentence):
                     self.data[i].append(sentence)
                     break
@@ -155,15 +176,22 @@ class BucketSentenceIter(mx.io.DataIter):
             # bucket size here
 
         # convert data into ndarrays for better speed during training
+        # note that not all sentences within a bucket are of equal len
+        # shorter sentences are padded with 0's
+        # x: sentences in this bucket, len(x): number of sentences in this bucket
         data = [np.zeros((len(x), buckets[i])) for i, x in enumerate(self.data)]
+        # for each bucket
         for i_bucket in range(len(self.buckets)):
+            # for each sentence in the same bucket
             for j in range(len(self.data[i_bucket])):
                 sentence = self.data[i_bucket][j]
                 data[i_bucket][j, :len(sentence)] = sentence
+        # n_bucket x n_sentence x bucket_size
         self.data = data
 
         # Get the size of each bucket, so that we could sample
         # uniformly from the bucket
+        # x: some bucket
         bucket_sizes = [len(x) for x in self.data]
 
         print("Summary of dataset ==================")
@@ -174,32 +202,44 @@ class BucketSentenceIter(mx.io.DataIter):
         self.make_data_iter_plan()
 
         self.init_states = init_states
+        # x: output info, x[0]: name of output layer, x[1]: tuple, shape of output batch x num_hidden
         self.init_state_arrays = [mx.nd.zeros(x[1]) for x in init_states]
 
+        # specify the shapes of input data and hidden layers
         self.provide_data = [('data', (batch_size, self.default_bucket_key))] + init_states
+        # specify the shape of label
         self.provide_label = [('softmax_label', (self.batch_size, self.default_bucket_key))]
 
     def make_data_iter_plan(self):
         "make a random data iteration plan"
         # truncate each bucket into multiple of batch-size
         bucket_n_batches = []
+        # for each bucket
         for i in range(len(self.data)):
+            # count how many batches there are in each bucket
             bucket_n_batches.append(len(self.data[i]) / self.batch_size)
+            # throw away remaining samples that are not enough for a batch
             self.data[i] = self.data[i][:int(bucket_n_batches[i]*self.batch_size)]
-
+        # concatenate in horizontal direction
+        # bucket_plan maps each batch to its correspoding bucket index
+        # suppose that batches are [1,3,2], then bucket_plan is [0,1,1,1,2,2]
         bucket_plan = np.hstack([np.zeros(n, int)+i for i, n in enumerate(bucket_n_batches)])
+        # shuffle buckets, and then shuffle seqs in each bucket
         np.random.shuffle(bucket_plan)
 
         bucket_idx_all = [np.random.permutation(len(x)) for x in self.data]
 
         self.bucket_plan = bucket_plan
         self.bucket_idx_all = bucket_idx_all
+        # index for current batch in each bucket
         self.bucket_curr_idx = [0 for x in self.data]
 
+        # buffers for batch data in each bucket
         self.data_buffer = []
         self.label_buffer = []
         for i_bucket in range(len(self.data)):
             if not self.model_parallel:
+                # batch_size x bucket_size of i'th bucket
                 data = np.zeros((self.batch_size, self.buckets[i_bucket]))
                 label = np.zeros((self.batch_size, self.buckets[i_bucket]))
                 self.data_buffer.append(data)
@@ -219,6 +259,7 @@ class BucketSentenceIter(mx.io.DataIter):
         for i_bucket in self.bucket_plan:
             data = self.data_buffer[i_bucket]
             i_idx = self.bucket_curr_idx[i_bucket]
+            # index range for shuffled data in a batch of sentences
             idx = self.bucket_idx_all[i_bucket][i_idx:i_idx+self.batch_size]
             self.bucket_curr_idx[i_bucket] += self.batch_size
             
@@ -240,6 +281,7 @@ class BucketSentenceIter(mx.io.DataIter):
                     assert len(sentence) == self.buckets[i_bucket]
                 
                 label = self.label_buffer[i_bucket]
+                # In language model, our goal is to predict the next word
                 label[:, :-1] = data[:, 1:]
                 label[:, -1] = 0
 

@@ -52,17 +52,13 @@ def default_text2id(sentence, the_vocab):
 
 
 def gen_buckets_kmeans(sentences, num_buckets, the_vocab):
-    len_dict = {}
-    max_len = -1
-    # get max length of sentences and a dict(bucket) with key equals sentence length
-    # and value equals the number of sentences in the same bucket
     lens = []
     for sentence in sentences:
         words = default_text2id(sentence, the_vocab)
         lens.append(len(words))
-    lens_np = np.array(lens)[:, None]
+    lens = np.array(lens)
     kmeans = KMeans(n_clusters=num_buckets, random_state=1)
-    assignment = kmeans.fit_predict(lens_np)
+    assignment = kmeans.fit_predict(lens[:, None])
     buckets = []
     for i in range(num_buckets):
         idx = list(np.where(assignment==i)[0])
@@ -139,6 +135,10 @@ class BucketSentenceIter(mx.io.DataIter):
         self.num_buckets = num_buckets
         # bucket: (sent_len, idx)
         buckets = gen_buckets_kmeans(sentences, num_buckets, vocab)
+        # sequence lengths of sentences in each bucket
+        self.sequence_length = []
+        for bucket in buckets:
+            self.sequence_length.append(np.array([sent_len for sent_len, _ in bucket]))
         # data of buckets, e.g. self.data[0] may be the bucket(type list) of all sentences of length 1
         # equivalent to: [[]] * len(buckets)
         self.data = [[] for _ in range(len(buckets))]
@@ -185,6 +185,9 @@ class BucketSentenceIter(mx.io.DataIter):
         # x: some bucket
         bucket_sizes = [len(x) for x in self.data]
 
+        self.batch_size = batch_size
+        self.make_data_iter_plan()
+
         print("Summary of dataset ==================")
         max_lens_bucket = []
         min_lens_bucket = []
@@ -207,20 +210,18 @@ class BucketSentenceIter(mx.io.DataIter):
         self.avg_lens_bucket = [math.ceil(len_) for len_ in avg_lens_bucket]
 
         for i in range(len(buckets)):
-            print("bucket %d : %d samples, max len:%d, min len:%d, avg len:%f" % (i, bucket_sizes[i],
-                                                                                  max_lens_bucket[i],
-                                                                                  min_lens_bucket[i], avg_lens_bucket[i]))
-
-
-        self.batch_size = batch_size
-        self.make_data_iter_plan()
+            print("bucket %d : %d samples, max len:%d, min len:%d, avg len:%f"
+                  % (i, bucket_sizes[i], max_lens_bucket[i],
+                     min_lens_bucket[i], avg_lens_bucket[i]))
+        print "batch size is:%d,total number of batches:%d"%(self.batch_size,self.num_batches)
 
         self.init_states = init_states
         # x: output info, x[0]: name of output layer, x[1]: tuple, shape of output batch x num_hidden
         self.init_state_arrays = [mx.nd.zeros(x[1]) for x in init_states]
 
         # specify the shapes of input data and hidden layers
-        self.provide_data = [('data', (batch_size, self.default_bucket_key))] + init_states
+        self.provide_data = [('data', (batch_size, self.default_bucket_key)), ('sequence_length', (batch_size,))]\
+                            + init_states
         # specify the shape of label
         self.provide_label = [('softmax_label', (self.batch_size, self.default_bucket_key))]
 
@@ -228,10 +229,12 @@ class BucketSentenceIter(mx.io.DataIter):
         "make a random data iteration plan"
         # truncate each bucket into multiple of batch-size
         bucket_n_batches = []
+        self.num_batches = 0
         # for each bucket
         for i in range(len(self.data)):
             # count how many batches there are in each bucket
             bucket_n_batches.append(len(self.data[i]) / self.batch_size)
+            self.num_batches += bucket_n_batches[-1]
             # throw away remaining samples that are not enough for a batch
             self.data[i] = self.data[i][:int(bucket_n_batches[i] * self.batch_size)]
         # concatenate in horizontal direction
@@ -274,6 +277,7 @@ class BucketSentenceIter(mx.io.DataIter):
             data = self.data_buffer[i_bucket]
             i_idx = self.bucket_curr_idx[i_bucket]
             # index range for shuffled data in a batch of sentences
+            # note that idx is the indices within a bucket, not global indices(of sentences)
             idx = self.bucket_idx_all[i_bucket][i_idx:i_idx + self.batch_size]
             self.bucket_curr_idx[i_bucket] += self.batch_size
 
@@ -295,10 +299,11 @@ class BucketSentenceIter(mx.io.DataIter):
                 # In language model, our goal is to predict the next word
                 label[:, :-1] = data[:, 1:]
                 label[:, -1] = 0
-
-                data_all = [mx.nd.array(data)] + self.init_state_arrays
+                # sequence_length for mask layer
+                sequence_length = self.sequence_length[i_bucket][idx]
+                data_all = [mx.nd.array(data), mx.nd.array(sequence_length)] + self.init_state_arrays
                 label_all = [mx.nd.array(label)]
-                data_names = ['data'] + init_state_names
+                data_names = ['data', 'sequence_length'] + init_state_names
                 label_names = ['softmax_label']
                 data_batch = SimpleBatch(data_names, data_all, label_names, label_all,
                                          self.maxlen_per_bucket[i_bucket])
@@ -321,6 +326,7 @@ if __name__ == "__main__":
     count = 1
     for batch_ in data_train:
         print "data shape:%s, label shape:%s"%(str(batch_.data[0].shape),str(batch_.label[0].shape))
+        print "batch sent len:%s"%str(batch_.data[1].asnumpy())
         count += 1
     print "total %d batches"%count
     print data_train.default_bucket_key

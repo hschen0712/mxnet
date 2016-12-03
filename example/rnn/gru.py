@@ -1,3 +1,4 @@
+# modified by hschen at 2016.12.03 12:33
 # pylint: disable=C0111,too-many-arguments,too-many-instance-attributes,too-many-locals,redefined-outer-name,fixme
 # pylint: disable=superfluous-parens, no-member, invalid-name
 import sys
@@ -56,8 +57,7 @@ def gru(num_hidden, indata, prev_state, param, seqidx, layeridx, dropout=0.):
     return GRUState(h=next_h)
 
 def gru_unroll(num_gru_layer, seq_len, input_size,
-               num_hidden, num_embed, num_label, dropout=0.):
-    seqidx = 0
+               num_hidden, num_embed, num_label, use_mask=False, dropout=0.):
     embed_weight = mx.sym.Variable("embed_weight")
     cls_weight = mx.sym.Variable("cls_weight")
     cls_bias = mx.sym.Variable("cls_bias")
@@ -75,17 +75,25 @@ def gru_unroll(num_gru_layer, seq_len, input_size,
         state = GRUState(h=mx.sym.Variable("l%d_init_h" % i))
         last_states.append(state)
     assert(len(last_states) == num_gru_layer)
-    # embeding layer
+    # batch_size x seq_len
     data = mx.sym.Variable('data')
     label = mx.sym.Variable('softmax_label')
+    # data: batch_size x seq_len
+    # input_size stands for vocab_size
+    # ouput shape: batch_size x seq_len x vocab_size
     embed = mx.sym.Embedding(data=data, input_dim=input_size,
                              weight=embed_weight, output_dim=num_embed, name='embed')
+    # masked_embed = mx.sym.broadcast_mul(lhs=embed, rhs=mask, name="masked_embed")
+    # wordvec: can be think of as a list of length seq_len
+    # that contains tensors of shape batch_size x vocab_size
     wordvec = mx.sym.SliceChannel(data=embed, num_outputs=seq_len, squeeze_axis=1)
+    if use_mask:
+        mask = mx.sym.Variable('mask')
+        maskvec = mx.sym.SliceChannel(data=mask, num_outputs=seq_len)
 
     hidden_all = []
     for seqidx in range(seq_len):
         hidden = wordvec[seqidx]
-
         # stack GRU
         for i in range(num_gru_layer):
             if i == 0:
@@ -96,6 +104,11 @@ def gru_unroll(num_gru_layer, seq_len, input_size,
                              prev_state=last_states[i],
                              param=param_cells[i],
                              seqidx=seqidx, layeridx=i, dropout=dp_ratio)
+            if use_mask:
+                _mask = maskvec[seqidx]
+                # apply mask
+                next_h = mx.sym.broadcast_mul(1. - _mask, last_states[i].h) + mx.sym.broadcast_mul(_mask, next_state.h)
+                next_state = GRUState(h=next_h)
             hidden = next_state.h
             last_states[i] = next_state
         # decoder

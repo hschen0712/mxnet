@@ -13,3 +13,11 @@ This folder contains RNN examples using low level symbol interface.
 
 Performance Note:
 More ```MXNET_GPU_WORKER_NTHREADS``` may lead to better performance. For setting ```MXNET_GPU_WORKER_NTHREADS```, please refer to [Environment Variables](https://mxnet.readthedocs.org/en/latest/how_to/env_var.html).
+
+## Changes
+This code was modified by hschen0712, added mask to the ptb language model and fixed bugs when computing perplexity. 
+
+## How to run this code
+
+Excecute the following command:
+`nohup python gru_bucketing_mask.py > log 2>&1 &`

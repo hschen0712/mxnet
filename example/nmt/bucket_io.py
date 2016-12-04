@@ -5,7 +5,6 @@
 """
 
 from trans_utils import read_tokens, build_vocab, text2id
-from sklearn.cluster import KMeans
 import numpy as np
 import mxnet as mx
 import cPickle as pickle
@@ -65,7 +64,8 @@ class ParallelCorpusIter(mx.io.DataIter):
     """
     Parallel Corpus Iter
     """
-    def __init__(self, src_data_path, trg_data_path, src_vocab, trg_vocab, init_states, batch_size, bucket_key=(50, 40)):
+    def __init__(self, src_data_path, trg_data_path, src_vocab, trg_vocab,
+                 enc_init_states, batch_size, bucket_key=(50, 40)):
         super(ParallelCorpusIter, self).__init__()
         self.src_vocab = src_vocab
         self.trg_vocab = trg_vocab
@@ -113,18 +113,21 @@ class ParallelCorpusIter(mx.io.DataIter):
 
         self.batch_size = batch_size
 
-        self.init_states = init_states
+        self.enc_init_states = enc_init_states
+        # self.dec_init_states = dec_init_states
         # x: output info, x[0]: name of output layer, x[1]: tuple, shape of output
-        self.init_state_names = [x[0] for x in init_states]
-        self.init_state_arrays = [mx.nd.zeros(x[1]) for x in init_states]
+        self.enc_init_state_names = [x[0] for x in enc_init_states]
+        self.enc_init_state_arrays = [mx.nd.zeros(x[1]) for x in enc_init_states]
+        # self.dec_init_state_names = [x[0] for x in dec_init_states]
+        # self.dec_init_state_arrays = [mx.nd.zeros(x[1]) for x in dec_init_states]
+
         self.make_iter_plan()
         # specify the shapes of input data and hidden layers
         self.provide_data = [('src_data', (batch_size, self.default_bucket_key[0])),
                              ('src_mask', (batch_size, self.default_bucket_key[0])),
-                             ('trg_data', (batch_size, self.default_bucket_key[1])),
-                             ('trg_mask', (batch_size, self.default_bucket_key[1]))]
+                             ('trg_mask', (batch_size, self.default_bucket_key[1]))] + enc_init_states
         # specify the shape of label
-        self.provide_label = [('softmax_label', (self.batch_size, self.default_bucket_key))]
+        self.provide_label = [('trg_data', (batch_size, self.default_bucket_key[1]))]
 
     def make_iter_plan(self):
         indices = range(len(self.src_data))
@@ -139,10 +142,10 @@ class ParallelCorpusIter(mx.io.DataIter):
             trg_data = self.trg_data[batch_idx]
             trg_mask = self.trg_mask[batch_idx]
 
-            data_all = [mx.nd.array(src_data), mx.nd.array(src_mask)] + self.init_state_arrays
-            label_all = [mx.nd.array(trg_data), mx.nd.array(trg_mask)]
-            data_names = ['src_data', 'src_mask'] + self.init_state_names
-            label_names = ['trg_data', 'trg_mask']
+            data_all = [mx.nd.array(src_data), mx.nd.array(src_mask), mx.nd.array(trg_mask)] + self.enc_init_state_arrays
+            label_all = [mx.nd.array(trg_data)]
+            data_names = ['src_data', 'src_mask', 'trg_mask'] + self.enc_init_state_names
+            label_names = ['trg_data']
 
             data_batch = SimpleBatch(data_names, data_all, label_names, label_all,
                                      self.default_bucket_key)
